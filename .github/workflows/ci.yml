@@ -16,7 +16,9 @@ jobs:
         run: |
           set -euo pipefail
           PATTERN='sk-or-v1-|sk-[a-f0-9]{32}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
-          if git log -p --all | grep -inE "$PATTERN"; then
+          # exclude this workflow file itself: its own pattern definition
+          # contains these literal substrings, which self-matches.
+          if git log -p --all -- . ':(exclude).github/workflows/ci.yml' | grep -inE "$PATTERN"; then
             echo "::error::secret-shaped string found in history — see matches above"
             exit 1
           fi
