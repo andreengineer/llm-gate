@@ -1,0 +1,55 @@
+# Port-as-identity (GATE_MIGRATION_PLAN.md Step 2, Path B).
+#
+# Each port is a fixed identity — the agent listening there doesn't need to
+# set any custom header to be identified. This is the preferred path for any
+# tool whose HTTP client isn't reachable to inject headers into (dcode,
+# opencode, isaura, hermes — see note below).
+#
+# There is no "claw" port. It was originally planned as its own identity but
+# confirmed to be a role label for the same isaura/8788 gateway, not a
+# separate system — its old Playwright duties live inside isaura's own code
+# or moved to Hermes's Browserbase integration. Port 8790 is deliberately
+# unused, not reassigned, to avoid confusing it with a real removed agent.
+#
+# require_run_id: true  -> X-Run-Id header is mandatory (400 if absent).
+# require_run_id: false -> if X-Run-Id is absent, the gate synthesizes one:
+#   {agent_id}_{sha8(first system prompt)}_{hour_bucket}
+#   Coarse, but preserves per-run cap and loop detection — a meterless agent
+#   is worse than a coarsely metered one.
+#   hermes was originally slated for Path A (header injection, since it's
+#   custom Python that could set headers) — but hermes-agent turned out to
+#   be a 100+ module codebase and no clear default_headers/injection point
+#   was found in a reasonable search. Rather than force require_run_id:true
+#   with no verified mechanism (= guaranteed 400 on every request), hermes
+#   uses Path B like everything else. It DOES natively support
+#   OPENROUTER_BASE_URL as an env var override, which is how it's repointed.
+#
+# enforcement: "enforce"  -> deny-list/ui-only ceiling ALWAYS block (hard,
+#   categorical rules — blocking costs nothing in lost observability). Budget
+#   caps, loop detection, dedup, and mid-tier approval also block.
+# enforcement: "log_only" -> deny-list/ui-only ceiling still ALWAYS block
+#   (never relaxed, no exceptions). Everything else (budgets, loop detection,
+#   dedup, mid-tier approval) is recorded to would_block_events and ALLOWED
+#   THROUGH instead of blocking — this is the observation window per
+#   newly-repointed agent, so a false-positive threshold doesn't break a
+#   working agent on day one. Real spend is still metered normally either way.
+#   ~/.llm-gate/HALT remains a full manual override regardless of this flag.
+#   Window length per IMPROVEMENTS.md compressed cadence: isaura 4h (traffic
+#   is low, failure mode is a visible 403 not silent loss), hermes/claw/dcode
+#   2h each when their turn comes.
+#
+# default_task_class: free-tier task-class gate (SONNET.md §1). A free-tier
+#   (":free" model) request needs a qualifying X-Task-Class header
+#   (background|experiment|cron) OR to arrive on a port with this set. Only
+#   opencode has it — its whole purpose is low-latency free-tier testing on
+#   cron/night goals. isaura is hardcoded (in chat.py, not here) to NEVER
+#   qualify for free tier regardless of any header it might send — no
+#   exceptions list, client-facing traffic doesn't get the unmetered tier.
+
+8787: { agent_id: "manual",   require_run_id: true,  enforcement: "enforce"  }  # ad-hoc / curl testing
+8788: { agent_id: "isaura",   require_run_id: false, enforcement: "enforce"  }  # flipped 2026-07-24 21:39 — reviewed, clean (thin real traffic, no red flags)
+8789: { agent_id: "hermes",   require_run_id: false, enforcement: "enforce"  }  # flipped 2026-07-25 00:59 — stream_options 400 fixed and verified live, would-block clean over 48h
+8790: { agent_id: "claw-hermes", require_run_id: false, enforcement: "log_only" }  # added 2026-08-04. OpenClaw's profile NAMED "hermes" (~/.openclaw-hermes, gateway :18790, @baphometisking_bot) — NOT Hermes-sudo, which is agent_id "hermes" on 8789. Prefixed claw- so the two never get conflated. log_only until real traffic is reviewed, same as every other port's rollout.
+8791: { agent_id: "dcode",    require_run_id: false, enforcement: "enforce"  }  # flipped 2026-07-24 21:39 — reviewed, clean (thin real traffic, no red flags)
+8792: { agent_id: "opencode", require_run_id: false, enforcement: "enforce",  default_task_class: "experiment" }  # does not route through the gate (Step 5, own key) — entry unused but kept reserved
+8793: { agent_id: "hermes-review", require_run_id: false, enforcement: "enforce" }  # added 2026-09-17 — isolates agent/background_review.py's skill/memory curator fork from the "hermes" hourly budget on 8789 (see app/config.py review_agent_hourly_usd), so a stuck review turn can never exhaust the same bucket live Telegram/cron traffic draws from. Straight to enforce, not log_only: the whole point is bounding an unsupervised fork, not an observation window for new client traffic.

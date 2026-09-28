@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""bin/run-agent <name> [args...] — the only sanctioned launcher.
+
+Checks loadavg, MemAvailable, and weight-class conflicts (agents.yaml)
+before starting a heavy agent. Refuses and prints exact remediation on
+failure. NEVER auto-kills another agent — an auto-kill mid-task loses
+state, so refuse-and-instruct is the correct failure mode (Andre executes
+/stop themselves).
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+AGENTS_YAML = Path(__file__).resolve().parent.parent / "agents.yaml"
+
+
+def load_config() -> dict:
+    return yaml.safe_load(AGENTS_YAML.read_text())
+
+
+def loadavg_1m() -> float:
+    return os.getloadavg()[0]
+
+
+def mem_available_mb() -> float:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1024
+    raise RuntimeError("MemAvailable not found in /proc/meminfo")
+
+
+def pids_for_pattern(pattern: str) -> list[int]:
+    try:
+        out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    except FileNotFoundError:
+        return []
+    if out.returncode not in (0, 1):
+        return []
+    return [int(p) for p in out.stdout.split()]
+
+
+def rss_mb_for_pids(pids: list[int]) -> float:
+    total_kb = 0
+    for pid in pids:
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                total_kb += int(line.split()[1])
+                break
+    return total_kb / 1024
+
+
+def running_agents(config: dict, exclude: str | None = None) -> dict[str, tuple[list[int], float]]:
+    result = {}
+    for name, spec in config["agents"].items():
+        if name == exclude:
+            continue
+        pids = pids_for_pattern(spec["pgrep_pattern"])
+        if pids:
+            result[name] = (pids, rss_mb_for_pids(pids))
+    return result
+
+
+def refuse(message: str) -> None:
+    print(f"REFUSED: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("usage: run-agent <name> [args...]", file=sys.stderr)
+        sys.exit(2)
+
+    name = sys.argv[1]
+    passthrough_args = sys.argv[2:]
+
+    config = load_config()
+    agents = config["agents"]
+    if name not in agents:
+        refuse(f"unknown agent '{name}'. Known: {', '.join(agents)}")
+
+    spec = agents[name]
+    weight = spec["weight"]
+    thresholds = config["resource_thresholds"]
+
+    others = running_agents(config, exclude=name)
+
+    load = loadavg_1m()
+    if load >= thresholds["loadavg_1m_max"]:
+        refuse(f"loadavg(1m)={load:.2f} >= {thresholds['loadavg_1m_max']}. System is busy, wait and retry.")
+
+    mem_avail = mem_available_mb()
+    if mem_avail <= thresholds["mem_available_min_mb"]:
+        if others:
+            ranked = sorted(others.items(), key=lambda kv: kv[1][1], reverse=True)
+            stop_list = ", ".join(f"/stop {n} ({rss/1024:.1f}GB)" for n, (_, rss) in ranked)
+            refuse(f"RAM {mem_avail/1024:.1f}GB free. Stop first: {stop_list}. Then rerun.")
+        refuse(f"RAM {mem_avail/1024:.1f}GB free (< {thresholds['mem_available_min_mb']}MB) and no other "
+                f"tracked agent is running to stop — this is genuine system pressure, not a conflict.")
+
+    if weight == "heavy":
+        heavy_running = {n: v for n, v in others.items() if agents[n]["weight"] == "heavy"}
+        claw_running = {n: v for n, v in others.items() if agents[n]["weight"] == "medium"}
+        conflicts = {**heavy_running, **claw_running}
+        if conflicts:
+            stop_list = ", ".join(f"/stop {n} ({rss/1024:.1f}GB)" for n, (_, rss) in conflicts.items())
+            refuse(f"heavy agent requires sole use of the host, never alongside claw. "
+                    f"Currently running: {stop_list}. Then rerun.")
+
+    if weight == "medium":
+        heavy_running = {n: v for n, v in others.items() if agents[n]["weight"] == "heavy"}
+        if heavy_running:
+            stop_list = ", ".join(f"/stop {n} ({rss/1024:.1f}GB)" for n, (_, rss) in heavy_running.items())
+            refuse(f"claw must not run alongside a heavy agent. Currently running: {stop_list}. Then rerun.")
+
+    launch = spec.get("launch")
+    if not launch:
+        print(f"OK: resource check passed for '{name}' ({weight}). "
+              f"It runs as a standing service outside this wrapper — nothing to launch.")
+        return
+
+    print(f"OK: resource check passed for '{name}' ({weight}). Launching: {' '.join(launch + passthrough_args)}")
+    os.execvp(launch[0], launch + passthrough_args)
+
+
+if __name__ == "__main__":
+    main()

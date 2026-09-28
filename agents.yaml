@@ -1,0 +1,38 @@
+# Resource-gate weight classes for bin/run-agent (HERMES_SPEND_GUARDRAILS.md
+# section 5). Host = i7-2600, 4c/8t — one heavy agent at a time, and heavy
+# never runs alongside claw (browser = RAM heavy-ish too).
+#
+# `pgrep_pattern` is matched with `pgrep -f` against the full command line.
+# `launch` is only used for agents this wrapper actually starts per task
+# (dcode, opencode). hermes and claw run as long-lived services managed
+# outside this wrapper — run-agent only reports on / resource-gates them,
+# it does not know how to (re)start those services and should not guess.
+
+agents:
+  hermes:
+    weight: light
+    pgrep_pattern: "hermes_cli.main gateway run"
+    launch: null
+    notes: "always-on, first receiver — no resource gate needed to start it"
+
+  claw:
+    weight: medium
+    pgrep_pattern: "openclaw/dist/index.js"
+    launch: null
+    notes: "openclaw gateway(s) — procurement, search, agentic messaging"
+
+  dcode:
+    weight: heavy
+    pgrep_pattern: "deepagents_code"
+    launch: ["dcode"]
+    notes: "build/refactor/multi-file code"
+
+  opencode:
+    weight: heavy
+    pgrep_pattern: "\\.opencode/bin/opencode"
+    launch: ["opencode"]
+    notes: "low-latency free-tier model testing, cron/night goals only"
+
+resource_thresholds:
+  loadavg_1m_max: 6.0
+  mem_available_min_mb: 2500

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""llm-gate CLI — surge mode control (SONNET.md §2).
+
+    llm-gate surge --minutes N --extra-cap X [--allow-frontier] --reason "..."
+    llm-gate surge --end
+    llm-gate surge --status
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+GATE_URL = "http://127.0.0.1:8787"
+
+
+def _post(path: str, body: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        f"{GATE_URL}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def _get(path: str) -> tuple[int, dict]:
+    try:
+        with urllib.request.urlopen(f"{GATE_URL}{path}", timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def cmd_surge(args: argparse.Namespace) -> int:
+    if args.status:
+        status, body = _get("/admin/surge")
+        print(json.dumps(body, indent=2))
+        return 0 if status == 200 else 1
+
+    if args.end:
+        status, body = _post("/admin/surge/end", {})
+        print(json.dumps(body, indent=2))
+        return 0 if status == 200 else 1
+
+    if args.minutes is None or args.extra_cap is None or not args.reason:
+        print("usage: llm-gate surge --minutes N --extra-cap X [--allow-frontier] --reason \"...\"",
+              file=sys.stderr)
+        return 2
+
+    status, body = _post("/admin/surge", {
+        "minutes": args.minutes,
+        "extra_cap": args.extra_cap,
+        "allow_frontier": args.allow_frontier,
+        "reason": args.reason,
+    })
+    print(json.dumps(body, indent=2))
+    if status != 200:
+        print(f"REFUSED: {body.get('detail', {}).get('reason', body)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="llm-gate")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    surge_p = sub.add_parser("surge", help="deliberate, bounded, logged cap escalation")
+    surge_p.add_argument("--minutes", type=float, default=None)
+    surge_p.add_argument("--extra-cap", type=float, default=None)
+    surge_p.add_argument("--allow-frontier", action="store_true")
+    surge_p.add_argument("--reason", type=str, default=None)
+    surge_p.add_argument("--end", action="store_true")
+    surge_p.add_argument("--status", action="store_true")
+    surge_p.set_defaults(func=cmd_surge)
+
+    args = parser.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
