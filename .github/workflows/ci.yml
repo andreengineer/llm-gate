@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  secret-grep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan full history for secret-shaped strings
+        run: |
+          set -euo pipefail
+          PATTERN='sk-or-v1-|sk-[a-f0-9]{32}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          if git log -p --all | grep -inE "$PATTERN"; then
+            echo "::error::secret-shaped string found in history — see matches above"
+            exit 1
+          fi
+          echo "clean: no secret-shaped strings in history"
+
+      - name: Scan for the maintainer's personal email
+        run: |
+          set -euo pipefail
+          if git log -p --all | grep -in "passamaniandre@gmail.com"; then
+            echo "::error::maintainer's personal email found in history — use the noreply git config"
+            exit 1
+          fi
+          echo "clean: no personal email in history"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv run pytest -q
