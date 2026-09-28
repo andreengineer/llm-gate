@@ -116,12 +116,12 @@ def test_global_daily_soft_then_hard():
     # the global aggregate cap being tested here
     for i in range(8):
         ledger.record_call(f"r_g{i}", f"agent_g{i}", "deepseek/deepseek-v4-flash", "deepseek", "cheap", 0.20, f"hg{i}")
-    # soft ($1.50) already crossed (8 x 0.20 = 1.60); still allowed until hard ($2.00)
+    # soft ($1.50) already crossed (8 x 0.20 = 1.60); still allowed until hard ($3.00)
     d = ledger.check_budgets("agent_g_new", "r_soft", "cheap", 0.05, "h5")
     assert d.allowed is True
     assert ledger.global_daily_spend() >= settings.global_daily_soft
 
-    ledger.record_call("seed3", "agent_g_extra", "deepseek/deepseek-v4-flash", "deepseek", "cheap", 0.50, "h6")
+    ledger.record_call("seed3", "agent_g_extra", "deepseek/deepseek-v4-flash", "deepseek", "cheap", 1.50, "h6")
     d2 = ledger.check_budgets("agent_g_final", "r_hard", "cheap", 0.01, "h7")
     assert d2.allowed is False
     assert d2.error_code == "global_daily_hard"
@@ -401,9 +401,9 @@ async def test_spread_with_one_mid_member_asks_single_itemized_approval(mock_ups
 
 
 def test_ledger_sums_across_both_upstreams_for_global_cap():
-    ledger.record_call("r_mix1", "agent_mix_a", "deepseek/deepseek-v4-flash", "deepseek", "cheap", 1.20, "m1")
-    ledger.record_call("r_mix2", "agent_mix_b", "google/gemini-2.5-flash", "openrouter", "cheap", 0.75, "m2")
-    assert ledger.global_daily_spend() >= 1.95
+    ledger.record_call("r_mix1", "agent_mix_a", "deepseek/deepseek-v4-flash", "deepseek", "cheap", 1.80, "m1")
+    ledger.record_call("r_mix2", "agent_mix_b", "google/gemini-2.5-flash", "openrouter", "cheap", 1.15, "m2")
+    assert ledger.global_daily_spend() >= 2.95
     d = ledger.check_budgets("agent_mix_c", "r_mix3", "cheap", 0.10, "m3")
     assert d.allowed is False
     assert d.error_code == "global_daily_hard"

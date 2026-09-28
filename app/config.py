@@ -50,7 +50,12 @@ class Settings(BaseSettings):
 
     # budgets (USD)
     global_daily_soft: float = 1.50
-    global_daily_hard: float = 2.00
+    global_daily_hard: float = 3.00  # raised 2026-09-28 from $2.00 (I7_MAIN.md
+                                      # §2.4 asked for $3 hard / $1.50 soft-flag
+                                      # headroom); hourly caps below are KEPT, not
+                                      # removed, per user decision — they fixed a
+                                      # real Sept-17 starvation incident and this
+                                      # daily raise is additive, not a replacement
     mid_tier_daily_cap: float = 0.60
     per_run_id_max_calls: int = 100
     per_run_id_max_usd: float = 1.00     # raised 2026-09-17 from $0.25 — real DeepSeek blend is
