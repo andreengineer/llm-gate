@@ -4,9 +4,12 @@ The point of this module is to stop wasting time (and log lines) attempting
 upstreams that are known-dead. Routing consults `is_usable()` BEFORE dispatch;
 an upstream marked unfunded/unauthorized/rate_limited is skipped, not tried.
 
-State is refreshed by `probe_loop` (on boot + every 15 min) with the cheapest
-possible completion per upstream — never a `/models` call, because `/models`
-succeeds on an unfunded account and is exactly what hid the original outage.
+State is PASSIVE (I7_MAIN §2.7): every real dispatch folds its result in via
+record_result(). `probe_loop` only re-probes providers already marked dead
+(unfunded/unauthorized/rate_limited), every 30 min, with a 1-token completion
+— never a `/models` call, because `/models` succeeds on an unfunded account
+and is exactly what hid the original outage. A healthy or unknown provider is
+never probed: probes burn free-tier daily quota for nothing.
 An empty completion (200 with zero content tokens) is the unfunded signature;
 two in a row marks the upstream `unfunded`.
 """
@@ -65,6 +68,8 @@ def _provider_key(provider: str) -> str:
         "openrouter": settings.openrouter_api_key,
         "aistudio": settings.google_ai_api_key,
         "groq": settings.groq_api_key,
+        "zai": settings.zai_api_key,
+        "cerebras": settings.cerebras_api_key,
     }.get(provider, "")
 
 
@@ -170,10 +175,13 @@ def snapshot() -> dict[str, dict]:
 
 
 async def probe_once(client: httpx.AsyncClient) -> None:
-    """One cheapest-possible completion per upstream. Never /models."""
+    """One 1-token completion per DEAD upstream. Never /models, never a
+    live/unknown provider (passive health covers those)."""
     for provider, model in _providers_and_probe_models().items():
         if not _provider_key(provider):
             mark(provider, UNAUTHORIZED, f"no {provider.upper()}_API_KEY configured")
+            continue
+        if get(provider).status not in _SKIP_STATES:
             continue
         payload = {
             "model": model,

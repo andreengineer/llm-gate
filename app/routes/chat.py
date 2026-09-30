@@ -17,7 +17,7 @@ from app.deny_list import check_fallback_array, deny_reason
 from app.estimate import estimate_cost
 from app import health, routing
 from app.ledger import (
-    chain_id, check_budgets, fallback_hop_count_today, free_fallback_count_today,
+    retry_after_seconds, chain_id, check_budgets, fallback_hop_count_today, free_fallback_count_today,
     frontier_approval_allowed, prompt_hash, record_call, record_rejection,
     record_would_block,
 )
@@ -50,7 +50,11 @@ CLIENT_FACING_AGENTS = NEVER_FREE_TIER_AGENTS
 
 # Free-tier providers, for ranking the cheapest fix in the failure envelope: a
 # key regen on a free provider needs no payment, so it's the cheapest next step.
-_FREE_PROVIDERS = {"aistudio", "groq"}
+_FREE_PROVIDERS = {"aistudio", "groq", "zai", "cerebras"}
+
+# Task classes that may use a free-tier model. "oneshot" (I7_MAIN §2.6) is a
+# routing hint toward rung 2, not a free-tier qualification.
+FREE_TASK_CLASSES = {"background", "experiment", "cron"}
 
 
 def _rung_action(result: str) -> str:
@@ -131,7 +135,11 @@ def _tunable_block(log_only: bool, run_id: str, agent_id: str, status_code: int,
     record_rejection(run_id, agent_id, error_code, status_code,
                      reason=reason, enforcement="enforce", model=model)
     logger.warning("[ENFORCED %s] blocked (%s): %s", agent_id, error_code, reason)
-    raise HTTPException(status_code, detail={"error": error_code, "reason": reason})
+    # I7_MAIN §2.4: every budget 429 carries Retry-After, so callers back off
+    # instead of hammering (and a budget 429 is raised before dispatch, so it
+    # can never trigger provider failover).
+    headers = {"Retry-After": str(retry_after_seconds(error_code))} if status_code == 429 else None
+    raise HTTPException(status_code, detail={"error": error_code, "reason": reason}, headers=headers)
 
 
 def _hard_block(run_id: str, agent_id: str, status_code: int, error_code: str,
@@ -217,7 +225,7 @@ async def chat_completions(request: Request):
 
     if tier == FREE:
         task_class = getattr(request.state, "task_class", None)
-        if x_agent_id in NEVER_FREE_TIER_AGENTS or task_class is None:
+        if x_agent_id in NEVER_FREE_TIER_AGENTS or task_class not in FREE_TASK_CLASSES:
             _hard_block(
                 x_run_id, x_agent_id, 403, "free_tier_class_required",
                 "free-tier models need a qualifying X-Task-Class "
@@ -305,7 +313,8 @@ async def chat_completions(request: Request):
 
         client_facing = x_agent_id in CLIENT_FACING_AGENTS
         try:
-            result = await upstream_dispatch(client, model, payload, client_facing=client_facing)
+            result = await upstream_dispatch(client, model, payload, client_facing=client_facing,
+                                             task_class=getattr(request.state, "task_class", None))
         except NoLiveRouteError as exc:
             # Total outage: every rung skipped (known-dead) or attempted-and-failed.
             # One structured 503 that ends the debugging session in one read, plus
@@ -324,8 +333,9 @@ async def chat_completions(request: Request):
             raise HTTPException(502, f"upstream error: {exc}") from exc
 
         cost = compute_cost(result.model_used, result.prompt_tokens, result.completion_tokens,
-                            cache_hit_tokens=result.cache_hit_tokens)
-        record_call(x_run_id, x_agent_id, result.model_used, result.upstream_used, tier, cost,
+                            cache_hit_tokens=result.cache_hit_tokens, provider=result.upstream_used)
+        # ledger stores the canonical model name (deepseek-v4-flash -> deepseek-flash)
+        record_call(x_run_id, x_agent_id, resolve_model_id(result.model_used), result.upstream_used, tier, cost,
                     p_hash, fallback_hop=result.fallback_hop, free_fallback=result.free_fallback)
 
         if result.fallback_hop:

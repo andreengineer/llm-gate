@@ -16,6 +16,8 @@ os.environ["OPENROUTER_API_KEY"] = "test-openrouter-key"
 # config and treat aistudio as configured, dispatching real (unmocked) calls.
 os.environ["GOOGLE_AI_API_KEY"] = ""
 os.environ["GROQ_API_KEY"] = ""
+os.environ["ZAI_API_KEY"] = ""
+os.environ["CEREBRAS_API_KEY"] = ""
 # Same leak, different shape (found 2026-09-17): agent/cron shells export
 # OPENROUTER_BASE_URL=http://127.0.0.1:8789/v1 (the gate's own port, per
 # scripts/verify_migration.sh). Inherited here it retargets every openrouter

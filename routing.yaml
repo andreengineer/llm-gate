@@ -5,47 +5,59 @@
 # Treat routing decisions that hinge on them as provisional.
 min_index: 45
 
+# I7_MAIN.md §2.1 — DeepSeek peak pricing (2x). Anchors are UTC hours
+# [start, end), Mon-Fri only. The old 16:30-00:30 window was wrong and is gone.
+# holidays_cst: Chinese public holidays (China calendar date) are off-peak 24h.
+# Add a year's block only after checking the State Council notice.
+deepseek_pricing:
+  peak_windows_utc: [[1, 4], [6, 10]]
+  holidays_cst:
+    - 2026-10-01
+    - 2026-10-02
+    - 2026-10-03
+    - 2026-10-04
+    - 2026-10-05
+    - 2026-10-06
+    - 2026-10-07
+
 ladder:
-  # ESCALATION_POLICY.md §1 — Ladder A, AVAILABILITY only. Cost-flat by
-  # construction: hop 1->2 keeps the MODEL constant and changes only the
-  # PROVIDER, so a provider outage can never make a request more expensive.
-  # Only once the same model is unavailable everywhere do we fall to the
-  # nearest free-tier equivalents. Capped at settings.max_provider_hops (3).
+  # I7_MAIN.md §2.5 — Ladder A, AVAILABILITY only. A hop must never cost more
+  # per token than rung 1 unless it is capped. Capped at max_provider_hops (3).
   # This ladder must NEVER cross into the quality ladder below.
+  # Gemini (aistudio) is intentionally NOT here: its free tier trains on the
+  # data, so it is cron/background-only and never isaura (adapter kept dormant).
   - rung: 1
-    provider: deepseek          # cheapest per token when funded
-    model: deepseek/deepseek-v4-flash
+    provider: deepseek          # cheap because of cache (99.4% hits Jun-Jul)
+    model: deepseek/deepseek-flash
     tier: cheap
     free: false
     index: 50
-    client_ok: true
+    client_ok: true             # isaura's ONLY rung (§2.6: rung 1 only, never free)
   - rung: 2
-    provider: openrouter        # SAME model, different account — blend unchanged
+    provider: openrouter        # same model family, different account
     model: deepseek/deepseek-v4-flash
     tier: cheap
     free: false
     index: 50
-    client_ok: true
+    client_ok: false            # §2.6: isaura client-facing is rung 1 only
+    provider_order: [DeepInfra, Novita]   # allow_fallbacks: false is forced in upstreams
+    daily_cap_usd: 0.30         # $0.09 in / $0.18 out, NO implicit cache -> capped
   - rung: 3
-    provider: openrouter        # LADDER_V2 §2.1 — GLM-4.7 Flash, third vendor (Z.ai).
-    model: z-ai/glm-4.7-flash   # idx 47, blend $0.145: cheaper than rung 1/2, so the
-    tier: cheap                 # cost invariant still holds. Beats a free rung here
-    free: false                 # because it is not rate-limited.
-    index: 47
-    client_ok: true
-  - rung: 4
-    provider: aistudio          # nearest free-tier flash, independent failure mode
-    model: gemini-2.5-flash
+    provider: zai               # Z.ai direct, free
+    model: glm-4.7-flash
     tier: free
     free: true
     index: 47                   # floor-exempt: $0 changes the calculus (LADDER_V2 §2.1)
     client_ok: false
-  # rung 5 (groq / llama-3.3-70b-versatile) removed 2026-09-28: confirmed live
-  # against console.groq.com/docs/rate-limits that llama-3.3-70b-versatile is
-  # no longer in Groq's free-tier model table (I7_MAIN.md §2.5). The
-  # app.upstreams Groq adapter/health-cache entry is left in place, dormant,
-  # in case Groq reinstates a usable free model later — only the dead ladder
-  # rung is removed here.
+  - rung: 4
+    provider: cerebras          # free, 1M tok/day, 5 RPM
+    model: gpt-oss-120b
+    tier: free
+    free: true
+    index: 45
+    client_ok: false
+  # Groq removed entirely (I7_MAIN §2.5): llama-3.3-70b-versatile left its free
+  # table and 8K TPM is smaller than one 6.7k-token context.
 
 remediation:
   unfunded: "wait for banking confirmation; nothing in the stack fixes an unfunded upstream"
@@ -54,6 +66,8 @@ remediation:
   timeout: "upstream slow or unreachable; check connectivity, it may recover next probe"
   server_error: "upstream returned 5xx; transient on their side, retry next chain"
   unknown: "no successful probe yet; run GET /admin/health after the next probe cycle"
+  truncated_reasoning: "reasoning used up max_tokens before any content; raise max_tokens or drop X-Think / thinking — the provider is fine"
+  rung_cap: "this rung hit its own daily $ cap (e.g. rung 2 $0.30/day); resets at 00:00 UTC"
 
 # ESCALATION_POLICY.md §2 — Ladder B, QUALITY only. Rises in cost, so it is
 # tightly triggered (app/escalation.py: deterministic triggers only, never
@@ -66,7 +80,7 @@ quality_ladder:
   auto_ceiling_blend: 1.00
   max_auto_hops: 2
   rungs:
-    - {model: deepseek/deepseek-v4-flash, provider: deepseek,   blend: null, index: 50}
+    - {model: deepseek/deepseek-flash,    provider: deepseek,   blend: null, index: 50}
     - {model: deepseek/deepseek-v4-flash, provider: openrouter, blend: null, index: 50}
     - {model: deepseek/deepseek-v4-pro,   provider: deepseek,   blend: null, index: 52}
     - {model: deepseek/deepseek-v4-pro,   provider: openrouter, blend: null, index: 52}

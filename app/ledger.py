@@ -199,6 +199,30 @@ def agent_hourly_spend(agent: str, now: float | None = None) -> float:
         return row[0]
 
 
+def rung_daily_spend(upstream: str, model: str, now: float | None = None) -> float:
+    """Today's (UTC) spend on one (upstream, model) pair — for per-rung caps
+    like I7_MAIN §2.5 rung 2's $0.30/day."""
+    now = now or time.time()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(SUM(cost_usd),0) FROM calls WHERE upstream = ? AND model = ? AND ts >= ?",
+            (upstream, model, _day_start(now)),
+        ).fetchone()
+        return row[0]
+
+
+def retry_after_seconds(error_code: str, now: float | None = None) -> int:
+    """Retry-After for a budget 429 (I7_MAIN §2.4): when the window that
+    tripped actually frees up. Daily caps reset at 00:00 UTC (_day_start)."""
+    now = now or time.time()
+    if error_code in ("global_daily_hard", "mid_tier_cap", "escalation_budget"):
+        return max(1, int(_day_start(now) + 86400 - now))
+    if error_code == "loop_detected":
+        return settings.chain_window_seconds
+    # agent_hourly_cap (rolling 1h), run_budget_killed (run ids bucket hourly)
+    return 3600
+
+
 def repeat_hash_count(p_hash: str, now: float | None = None) -> int:
     now = now or time.time()
     window = settings.repeat_hash_window_minutes * 60

@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     openrouter_api_key: str = ""
     google_ai_api_key: str = ""   # Google AI Studio (Gemini) — ROUTING_RESILIENCE rung 2
-    groq_api_key: str = ""        # Groq free tier — ROUTING_RESILIENCE rung 3
+    groq_api_key: str = ""        # Groq — dormant since I7_MAIN §2.5 dropped it from the ladder
+    zai_api_key: str = ""         # Z.ai direct, GLM-4.7-Flash free (I7_MAIN §2.5 rung 3)
+    cerebras_api_key: str = ""    # Cerebras free, 1M tok/day, 5 RPM (I7_MAIN §2.5 rung 4)
 
     deepseek_base_url: str = "https://api.deepseek.com"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -39,6 +41,8 @@ class Settings(BaseSettings):
     # other upstreams so one adapter path handles it (native Gemini API differs).
     aistudio_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    zai_base_url: str = "https://api.z.ai/api/paas/v4"
+    cerebras_base_url: str = "https://api.cerebras.ai/v1"
 
     # telegram — approval channel MUST be a separate bot from the Hermes gateway bot
     telegram_approval_bot_token: str = ""
@@ -76,7 +80,7 @@ class Settings(BaseSettings):
     repeat_hash_max_count: int = 5
 
     # routing resilience (ROUTING_RESILIENCE.md)
-    health_probe_interval_seconds: int = 900   # boot + every 15 min
+    health_probe_interval_seconds: int = 1800  # I7_MAIN §2.7: re-probe DEAD providers only, every 30 min
     chain_window_seconds: int = 120            # retries of same body within this window = ONE attempt chain
     chain_max_attempts: int = 6                # >this many attempts in one chain = a real loop -> 429
     routing_yaml_path: str = ""                # override; default is app/../routing.yaml

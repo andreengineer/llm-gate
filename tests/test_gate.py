@@ -473,7 +473,7 @@ async def test_bare_deepseek_model_name_resolves_and_routes(mock_upstreams):
     assert resp.status_code == 200
     assert ds_route.call_count == 1
     sent_model = json.loads(ds_route.calls[0].request.content)["model"]
-    assert sent_model == "deepseek-v4-flash"  # round-trips back to the real API's bare name
+    assert sent_model == "deepseek-flash"  # legacy name resolves to the canonical one (I7_MAIN §2.1)
 
 
 @pytest.mark.asyncio
@@ -846,7 +846,7 @@ async def test_hermes_shaped_retries_plus_failover_share_one_chain_no_429(mock_u
     # first one satisfying the rest from cache (see
     # test_synthesized_run_id_still_enforces_loop_detection above).
     mock_upstreams.post(DEEPSEEK_URL).mock(return_value=httpx.Response(200, json=_completion_body()))
-    payload = {"model": "deepseek/deepseek-v4-flash", "temperature": 0.9,
+    payload = {"model": "deepseek/deepseek-flash", "temperature": 0.9,
                "messages": [{"role": "user", "content": "chained"}]}
     headers = {"X-Run-Id": "r_chain1", "X-Agent-Id": "agent_chain1"}
     for _ in range(4):  # 3 retries + 1 failover, Hermes-shaped
@@ -916,7 +916,7 @@ async def test_admin_health_endpoint_returns_upstream_snapshot(mock_upstreams):
     body = resp.json()
     # groq dropped from the ladder 2026-09-28 (I7_MAIN.md §2.5): confirmed
     # live that llama-3.3-70b-versatile is no longer in Groq's free tier.
-    assert set(body["upstreams"]) == {"deepseek", "aistudio", "openrouter"}
+    assert set(body["upstreams"]) == {"deepseek", "openrouter", "zai", "cerebras"}
 
 
 @pytest.mark.asyncio
@@ -975,10 +975,17 @@ async def test_ladderA_500_retries_same_model_on_next_provider_blend_unchanged(m
     # broke. Rung 1 (deepseek) 500s; rung 2 must be the SAME model on openrouter.
     from app.routing import ladder
 
+    from app.models_registry import blend, price_at, resolve_model_id
+
     rungs = ladder()
-    assert rungs[0].model == rungs[1].model, "rung 1->2 must not change model"
+    # I7_MAIN §2.5: rung 2 is the same model family (legacy slug on OpenRouter),
+    # and must not cost more per token than rung 1.
+    assert resolve_model_id(rungs[0].model) == resolve_model_id(rungs[1].model), \
+        "rung 1->2 must not change model"
     assert rungs[0].provider != rungs[1].provider, "rung 1->2 must change provider"
-    assert registry.get(rungs[0].model).blend == registry.get(rungs[1].model).blend
+    r1 = price_at(rungs[0].model, provider=rungs[0].provider)
+    r2 = price_at(rungs[1].model, provider=rungs[1].provider)
+    assert blend(r2[0], r2[2]) <= blend(r1[0], r1[2])
 
     mock_upstreams.post(DEEPSEEK_URL).mock(return_value=httpx.Response(500))
     or_route = mock_upstreams.post(OPENROUTER_URL).mock(
@@ -993,6 +1000,7 @@ async def test_ladderA_500_retries_same_model_on_next_provider_blend_unchanged(m
     assert or_route.called
     sent = json.loads(or_route.calls[0].request.content)
     assert sent["model"] == "deepseek/deepseek-v4-flash", "failover must not swap the model"
+    assert sent["provider"] == {"order": ["DeepInfra", "Novita"], "allow_fallbacks": False}
 
 
 def test_ladderA_outage_never_crosses_into_ladderB():
@@ -1149,21 +1157,15 @@ def test_ladderB_requires_strictly_increasing_index():
     assert escalation.next_rung("deepseek/deepseek-v4-pro", hops_used=0) is None
 
 
-def test_glm47_flash_is_a_ladderA_rung_and_does_not_raise_cost():
-    # The operator's table averaged (in+out)/2, which makes GLM-4.7 Flash look
-    # more expensive than DS Flash ($0.23 vs $0.21). The gate weights 0.75/0.25,
-    # and GLM's cheap input ($0.06) makes it CHEAPER on that basis — so it is a
-    # legitimate non-increasing failover hop. Guard the real invariant.
+def test_glm47_flash_is_a_free_zai_rung_never_client_facing():
+    # I7_MAIN §2.5: GLM-4.7 Flash moved from OpenRouter (paid) to Z.ai direct
+    # (free). Free rungs are never client-facing (isaura data policy).
     from app.routing import ladder
 
-    rungs = ladder()
-    glm = [r for r in rungs if "glm-4.7" in r.model]
+    glm = [r for r in ladder() if "glm-4.7" in r.model]
     assert glm, "GLM-4.7 Flash must be on Ladder A"
-    assert glm[0].provider == "openrouter"
-
-    ds_blend = registry.get("deepseek/deepseek-v4-flash").blend
-    glm_blend = registry.get(glm[0].model).blend
-    assert glm_blend <= ds_blend, f"GLM-4.7 Flash ${glm_blend} must not exceed DS Flash ${ds_blend}"
+    assert glm[0].provider == "zai" and glm[0].free and not glm[0].client_ok
+    assert not [r for r in ladder(client_facing=True) if r.free]
 
 
 def test_qwen_is_absent_from_every_ladder():

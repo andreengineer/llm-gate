@@ -45,7 +45,7 @@ from tests.test_gate import _client, HEADERS  # noqa: E402
 def test_price_at_returns_distinct_hit_and_miss_for_deepseek_flash():
     miss, hit, out = price_at("deepseek/deepseek-v4-flash", ts=_off_peak_ts())
     assert miss == 0.15
-    assert hit == DEEPSEEK_CACHE_HIT_PRICES["deepseek/deepseek-v4-flash"] == 0.003
+    assert hit == DEEPSEEK_CACHE_HIT_PRICES["deepseek/deepseek-flash"] == 0.003
     assert out == 0.60
 
 

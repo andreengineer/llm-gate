@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import httpx
 
 from app.config import settings
-from app.models_registry import registry, CHEAP, FREE, price_at
+from app.models_registry import registry, CHEAP, FREE, price_at, resolve_model_id
 
 logger = logging.getLogger("llm-gate.upstream")
 
@@ -95,7 +95,11 @@ def _classify_status(status_code: int) -> str:
     return "unknown"
 
 
-def _forced_params(payload: dict, upstream: str) -> dict:
+def _caller_set_reasoning(body: dict) -> bool:
+    return any(k in body for k in ("thinking", "reasoning_effort", "reasoning"))
+
+
+def _forced_params(payload: dict, upstream: str, provider_order: tuple[str, ...] = ()) -> dict:
     out = dict(payload)
     # Internal-only marker set by chat.py from the X-Think header; never sent
     # upstream. Popped unconditionally so it can't leak into any provider's
@@ -118,7 +122,20 @@ def _forced_params(payload: dict, upstream: str) -> dict:
     # (hermes) include this alongside stream:true; left in place it pairs
     # with the forced stream:false above and upstream 400s on the combination
     if upstream == "openrouter":
-        out["provider"] = {"sort": "price", "allow_fallbacks": False}
+        if provider_order:
+            # I7_MAIN §2.5 rung 2: pinned to named hosts, never silently
+            # re-routed by OpenRouter to a pricier one.
+            out["provider"] = {"order": list(provider_order), "allow_fallbacks": False}
+        else:
+            out["provider"] = {"sort": "price", "allow_fallbacks": False}
+        # I7_MAIN §2.3: reasoning off by default on OpenRouter too. Field
+        # verified 2026-09-30 against openrouter.ai/docs reasoning-tokens:
+        # `reasoning: {enabled: false}` (== Anthropic-style thinking disabled).
+        if not think_requested and not _caller_set_reasoning(out):
+            out["reasoning"] = {"enabled": False}
+    if upstream == "zai" and not think_requested and "thinking" not in out:
+        # GLM-4.x thinks by default; same field shape as DeepSeek's.
+        out["thinking"] = {"type": "disabled"}
     # I7_MAIN.md §2.3: DeepSeek defaults to thinking ON (reasoning billed as
     # output at 2-6.6x the base output rate). Force it off unless the caller
     # already specified thinking/reasoning_effort explicitly, or opted in via
@@ -129,6 +146,24 @@ def _forced_params(payload: dict, upstream: str) -> dict:
         out["thinking"] = {"type": "disabled"}
     out.pop("models", None)  # fallback arrays are handled by the gate, not upstream
     return out
+
+
+def completion_kind(body: dict) -> str:
+    """"ok" | "empty" | "truncated_reasoning".
+
+    truncated_reasoning (I7_MAIN §2.3): no content and no tool calls, but
+    non-empty reasoning — thinking ate the whole max_tokens budget. The
+    provider is healthy and funded; this is NOT the unfunded signature and
+    must never be counted toward marking the upstream unfunded."""
+    if is_empty_completion(body):
+        return "empty"
+    for ch in body.get("choices") or []:
+        msg = (ch or {}).get("message") or {}
+        content = msg.get("content")
+        has_content = (isinstance(content, str) and content.strip()) or (isinstance(content, list) and content)
+        if has_content or msg.get("tool_calls"):
+            return "ok"
+    return "truncated_reasoning"
 
 
 def is_empty_completion(body: dict) -> bool:
@@ -164,8 +199,9 @@ async def _call_deepseek(client: httpx.AsyncClient, model_id: str, payload: dict
     )
 
 
-async def _call_openrouter(client: httpx.AsyncClient, model_id: str, payload: dict) -> httpx.Response:
-    body = _forced_params(payload, "openrouter")
+async def _call_openrouter(client: httpx.AsyncClient, model_id: str, payload: dict,
+                           provider_order: tuple[str, ...] = ()) -> httpx.Response:
+    body = _forced_params(payload, "openrouter", provider_order)
     body["model"] = model_id
     return await client.post(
         f"{settings.openrouter_base_url}/chat/completions",
@@ -202,6 +238,30 @@ async def _call_groq(client: httpx.AsyncClient, model_id: str, payload: dict) ->
     )
 
 
+async def _call_zai(client: httpx.AsyncClient, model_id: str, payload: dict) -> httpx.Response:
+    """Z.ai direct (I7_MAIN §2.5 rung 3) — GLM-4.7-Flash is free."""
+    body = _forced_params(payload, "zai")
+    body["model"] = model_id
+    return await client.post(
+        f"{settings.zai_base_url}/chat/completions",
+        json=body,
+        headers={"Authorization": f"Bearer {settings.zai_api_key}"},
+        timeout=60.0,
+    )
+
+
+async def _call_cerebras(client: httpx.AsyncClient, model_id: str, payload: dict) -> httpx.Response:
+    """Cerebras free tier (I7_MAIN §2.5 rung 4) — 1M tok/day, 5 RPM."""
+    body = _forced_params(payload, "cerebras")
+    body["model"] = model_id
+    return await client.post(
+        f"{settings.cerebras_base_url}/chat/completions",
+        json=body,
+        headers={"Authorization": f"Bearer {settings.cerebras_api_key}"},
+        timeout=60.0,
+    )
+
+
 # provider (health-cache key) -> adapter. deepseek's adapter strips the
 # "deepseek/" routing prefix; the others take the model id as-is.
 _PROVIDER_CALLERS = {
@@ -209,17 +269,22 @@ _PROVIDER_CALLERS = {
     "openrouter": _call_openrouter,
     "aistudio": _call_aistudio,
     "groq": _call_groq,
+    "zai": _call_zai,
+    "cerebras": _call_cerebras,
 }
 
 
 async def call_provider(
-    client: httpx.AsyncClient, provider: str, model_id: str, payload: dict
+    client: httpx.AsyncClient, provider: str, model_id: str, payload: dict,
+    provider_order: tuple[str, ...] = (),
 ) -> httpx.Response:
     """Dispatch one call to a named provider. Used by the escalation ladder
     (app/upstreams.dispatch) and the health probe (app/health.py)."""
     caller = _PROVIDER_CALLERS.get(provider)
     if caller is None:
         raise ValueError(f"unknown provider {provider!r}")
+    if provider == "openrouter" and provider_order:
+        return await caller(client, model_id, payload, provider_order)
     return await caller(client, model_id, payload)
 
 
@@ -233,7 +298,8 @@ def extract_usage(body: dict) -> tuple[int, int, int]:
 
 
 def compute_cost(
-    model_id: str, prompt_tokens: int, completion_tokens: int, cache_hit_tokens: int = 0
+    model_id: str, prompt_tokens: int, completion_tokens: int, cache_hit_tokens: int = 0,
+    provider: str | None = None,
 ) -> float:
     """Bill a call at the price in force *at this moment*.
 
@@ -242,12 +308,10 @@ def compute_cost(
     price must be resolved per call, not per process start, and prompt_tokens
     must be split into hit/miss before pricing (I7_MAIN.md §2.2).
     """
-    info = registry.get(model_id)
-    if info is None:
+    prices = price_at(model_id, provider=provider)
+    if prices is None:
         return 0.0
-    miss_per_m, hit_per_m, out_per_m = price_at(model_id) or (
-        info.input_per_m, info.input_per_m, info.output_per_m,
-    )
+    miss_per_m, hit_per_m, out_per_m = prices
     hit_tokens = min(max(cache_hit_tokens, 0), prompt_tokens)
     miss_tokens = prompt_tokens - hit_tokens
     return (
@@ -258,7 +322,8 @@ def compute_cost(
 
 
 async def dispatch(
-    client: httpx.AsyncClient, model_id: str, payload: dict, *, client_facing: bool = False
+    client: httpx.AsyncClient, model_id: str, payload: dict, *, client_facing: bool = False,
+    task_class: str | None = None,
 ) -> UpstreamResult:
     """Provider escalation ladder (ROUTING_RESILIENCE.md §3).
 
@@ -273,23 +338,38 @@ async def dispatch(
     return the §4 no_live_route envelope.
     """
     from app import health              # lazy import: health imports this module
+    from app.ledger import rung_daily_spend
     from app.routing import ladder as _ladder
 
     info = registry.get(model_id)
     primary_provider = info.upstream if info else "openrouter"
     primary_is_free = info.tier == FREE if info else False
 
-    # requested model first, then the ladder rungs as failover
-    order: list[tuple[int, str, str, bool]] = [(0, primary_provider, model_id, primary_is_free)]
-    for r in _ladder(client_facing):
-        order.append((r.rung, r.provider, r.model, r.free))
+    rungs = _ladder(client_facing)
+    # (rung, provider, model, is_free, provider_order, daily_cap_usd)
+    primary = (0, primary_provider, model_id, primary_is_free, (), None)
+    as_entry = lambda r: (r.rung, r.provider, r.model, r.free, r.provider_order, r.daily_cap_usd)
+
+    # I7_MAIN §2.6 task routing. Only applies when the caller asked for the
+    # default model (rung 1's) — a caller naming a specific model gets it.
+    # Client-facing traffic never gets reordered (rung 1 only, never free).
+    front: list = []
+    is_default_model = bool(rungs) and resolve_model_id(model_id) == resolve_model_id(rungs[0].model)
+    if not client_facing and is_default_model:
+        if task_class in ("background", "cron"):
+            front = [as_entry(r) for r in rungs if r.provider == "zai"]      # free first
+        elif task_class == "oneshot":
+            front = [as_entry(r) for r in rungs if r.rung == 2]             # output ~3x cheaper
+
+    # front (task-class preference), requested model, then the ladder as failover
+    order = front + [primary] + [as_entry(r) for r in rungs]
 
     attempted: list[RungAttempt] = []
     skipped: list[dict] = []
     tried: set[str] = set()
     hops = 0
 
-    for rung, provider, model, is_free in order:
+    for rung, provider, model, is_free, provider_order, daily_cap in order:
         if provider in tried:
             # This rung shares a provider (health-cache key) with one already
             # attempted this chain — e.g. rung 5's paid OpenRouter sibling
@@ -311,11 +391,15 @@ async def dispatch(
             skipped.append({"rung": rung, "provider": provider, "result": "hop_cap",
                             "detail": "max_provider_hops reached"})
             continue
+        if daily_cap is not None and rung_daily_spend(provider, resolve_model_id(model)) >= daily_cap:
+            skipped.append({"rung": rung, "provider": provider, "result": "rung_cap",
+                            "detail": f"rung daily cap ${daily_cap:.2f} reached"})
+            continue
         tried.add(provider)
         hops += 1
 
         try:
-            resp = await call_provider(client, provider, model, payload)
+            resp = await call_provider(client, provider, model, payload, provider_order)
         except httpx.TimeoutException:
             attempted.append(RungAttempt(rung, provider, model, "timeout", "no response before timeout"))
             health.record_result(provider, None, error="timeout")
@@ -349,8 +433,13 @@ async def dispatch(
             logger.warning("%s returned an empty completion for %s, escalating", provider, model)
             continue
 
-        # success
+        # success (a truncated_reasoning body is returned as-is: the provider
+        # is healthy, the caller's max_tokens/thinking choice is the fix)
         health.record_result(provider, status, body)
+        if completion_kind(body) == "truncated_reasoning":
+            logger.warning("%s/%s returned truncated_reasoning (no content, reasoning only)",
+                           provider, model)
+            body.setdefault("x_gate", {})["completion"] = "truncated_reasoning"
         pt, ct, cht = extract_usage(body)
         return UpstreamResult(
             body, provider, model, pt, ct,

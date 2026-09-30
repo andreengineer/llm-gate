@@ -60,8 +60,13 @@ UI_ONLY = "ui_only"
 # Vendor page: peak = 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri, billed at 2x
 # the off-peak rate. The values below are the OFF-PEAK base; price_at() applies
 # DEEPSEEK_PEAK_MULTIPLIER when the call lands inside a peak window.
+#
+# CANONICAL NAME 2026-09-30 (I7_MAIN §2.1): DeepSeek's /models now lists
+# "deepseek-flash" (DeepSeek-V4.1-Flash). The legacy "deepseek-v4-flash" is
+# still accepted upstream and billed as flash; both resolve to the canonical
+# id via BARE_MODEL_ALIASES so the ledger only ever stores one name.
 DEEPSEEK_STATIC_PRICES: dict[str, tuple[float, float]] = {
-    "deepseek/deepseek-v4-flash": (0.15, 0.60),   # $/M in(miss), out — off-peak blend 0.2625
+    "deepseek/deepseek-flash": (0.15, 0.60),      # $/M in(miss), out — off-peak blend 0.2625
     "deepseek/deepseek-v4-pro": (0.66, 1.98),     # $/M in(miss), out — off-peak blend 0.99
 }
 # Cache-HIT input price (I7_MAIN.md §2.2, confirmed 2026-09-26 against
@@ -75,7 +80,7 @@ DEEPSEEK_STATIC_PRICES: dict[str, tuple[float, float]] = {
 # to 3 values would ripple into boot-time price checks and tier classification
 # for no benefit — only compute_cost() needs the hit price.
 DEEPSEEK_CACHE_HIT_PRICES: dict[str, float] = {
-    "deepseek/deepseek-v4-flash": 0.003,   # $/M — off-peak
+    "deepseek/deepseek-flash": 0.003,      # $/M — off-peak
     "deepseek/deepseek-v4-pro": 0.022,     # $/M — off-peak
 }
 DEEPSEEK_PEAK_MULTIPLIER = 2.0
@@ -86,10 +91,44 @@ DEEPSEEK_PEAK_WINDOWS_UTC: tuple[tuple[int, int], ...] = ((1, 4), (6, 10))
 # 2026 National Day confirmed 2026-09-28 against the State Council General
 # Office notice (issued 2025-11-04): Oct 1-7 inclusive. Add each year's block
 # after checking the official notice — do not guess ahead of it.
+#
+# Source of truth is routing.yaml `deepseek_pricing:` (I7_MAIN §2.1 asks for the
+# UTC anchors and the holiday list to live there); these are the fallback
+# defaults if that section is missing.
 DEEPSEEK_OFF_PEAK_HOLIDAYS_CST: frozenset[str] = frozenset({
     "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
     "2026-10-05", "2026-10-06", "2026-10-07",
 })
+
+
+def _load_deepseek_pricing_yaml() -> None:
+    global DEEPSEEK_PEAK_WINDOWS_UTC, DEEPSEEK_OFF_PEAK_HOLIDAYS_CST
+    try:
+        import yaml
+        from app.config import ROUTING_YAML_PATH
+        spec = (yaml.safe_load(ROUTING_YAML_PATH.read_text()) or {}).get("deepseek_pricing") or {}
+    except Exception:
+        logger.exception("routing.yaml deepseek_pricing unreadable, keeping built-in defaults")
+        return
+    if spec.get("peak_windows_utc"):
+        DEEPSEEK_PEAK_WINDOWS_UTC = tuple((int(a), int(b)) for a, b in spec["peak_windows_utc"])
+    if spec.get("holidays_cst") is not None:
+        DEEPSEEK_OFF_PEAK_HOLIDAYS_CST = frozenset(str(d) for d in spec["holidays_cst"])
+
+
+_load_deepseek_pricing_yaml()
+
+# Non-DeepSeek providers serving a DeepSeek-family or free model, priced per
+# (provider, model) because the same model id costs different amounts on
+# different accounts. Rung 2 pins OpenRouter to DeepInfra/Novita
+# (allow_fallbacks: false) at $0.09 in / $0.18 out with NO implicit cache
+# (I7_MAIN §2.5, verified 2026-09-26 against the OR endpoints listing).
+# Z.ai GLM-4.7-Flash and Cerebras gpt-oss-120b are free tiers.
+PROVIDER_PRICES: dict[tuple[str, str], tuple[float, float]] = {
+    ("openrouter", "deepseek/deepseek-v4-flash"): (0.09, 0.18),
+    ("zai", "glm-4.7-flash"): (0.0, 0.0),
+    ("cerebras", "gpt-oss-120b"): (0.0, 0.0),
+}
 
 
 def is_deepseek_peak(ts: float | None = None) -> bool:
@@ -103,14 +142,25 @@ def is_deepseek_peak(ts: float | None = None) -> bool:
     return any(start <= now.hour < end for start, end in DEEPSEEK_PEAK_WINDOWS_UTC)
 
 
-def price_at(model_id: str, ts: float | None = None) -> tuple[float, float, float] | None:
+def price_at(
+    model_id: str, ts: float | None = None, provider: str | None = None,
+) -> tuple[float, float, float] | None:
     """(input_miss_per_m, input_hit_per_m, output_per_m) in USD at time `ts`,
     peak-aware for DeepSeek. Single source of truth for billing: static
     DeepSeek rows get the peak multiplier (applied to hit and miss alike —
     confirmed 2x on both in the vendor table), everything else falls through
     to the live registry entry with hit==miss (no cache-hit discount modeled
     for non-DeepSeek upstreams).
+
+    `provider` matters when the same model id is served by a non-DeepSeek
+    account (rung 2: deepseek-v4-flash on OpenRouter): that call is priced
+    from PROVIDER_PRICES, never at DeepSeek-direct rates.
     """
+    if provider is not None and provider != "deepseek":
+        pinned = PROVIDER_PRICES.get((provider, model_id))
+        if pinned is not None:
+            return (pinned[0], pinned[0], pinned[1])
+    model_id = resolve_model_id(model_id)
     base = DEEPSEEK_STATIC_PRICES.get(model_id)
     if base is None:
         info = registry.get(model_id)
@@ -126,9 +176,11 @@ def price_at(model_id: str, ts: float | None = None) -> tuple[float, float, floa
 # above) — mapped to their closest real equivalent rather than left to 400
 # against the real upstream on every call.
 BARE_MODEL_ALIASES: dict[str, str] = {
-    "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+    "deepseek-flash": "deepseek/deepseek-flash",
+    "deepseek-v4-flash": "deepseek/deepseek-flash",           # legacy, served+billed as flash
+    "deepseek/deepseek-v4-flash": "deepseek/deepseek-flash",  # legacy gate-style id
     "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
-    "deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek-chat": "deepseek/deepseek-flash",
     "deepseek-reasoner": "deepseek/deepseek-v4-pro",
 }
 

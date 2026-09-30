@@ -15,7 +15,7 @@ from app.config import ROUTING_YAML_PATH
 
 # Providers a request may be routed to. Every rung's `provider` must be one of
 # these — they are also the keys the health cache tracks.
-KNOWN_PROVIDERS = {"deepseek", "aistudio", "groq", "openrouter"}
+KNOWN_PROVIDERS = {"deepseek", "aistudio", "groq", "openrouter", "zai", "cerebras"}
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class Rung:
     free: bool         # True for :free / free-tier models
     client_ok: bool    # client-facing (isaura) may fail over onto this rung
     index: int = 0     # agentic-intelligence index; see min_index (LADDER_V2 §1)
+    provider_order: tuple[str, ...] = ()  # OpenRouter provider.order pin (I7_MAIN §2.5 rung 2)
+    daily_cap_usd: float | None = None    # per-rung $/day cap; rung skipped once reached
 
 
 class IndexFloorError(ValueError):
@@ -63,6 +65,9 @@ def _load(path=ROUTING_YAML_PATH) -> tuple[list[Rung], dict[str, str]]:
                 free=free,
                 client_ok=bool(spec.get("client_ok", False)),
                 index=index,
+                provider_order=tuple(spec.get("provider_order") or ()),
+                daily_cap_usd=(float(spec["daily_cap_usd"])
+                               if spec.get("daily_cap_usd") is not None else None),
             )
         )
     rungs.sort(key=lambda r: r.rung)

@@ -16,6 +16,7 @@ class PortIdentity:
     require_run_id: bool
     enforcement: str = "enforce"  # "enforce" | "log_only"
     default_task_class: str | None = None  # free-tier task-class gate, see chat.py
+    bind_tailscale: bool = False  # also listen on the Tailscale IP (I7_MAIN §4); never 0.0.0.0
 
     @property
     def log_only(self) -> bool:
@@ -30,6 +31,7 @@ def load_ports() -> dict[int, PortIdentity]:
             bool(spec["require_run_id"]),
             spec.get("enforcement", "enforce"),
             spec.get("default_task_class"),
+            bool(spec.get("bind_tailscale", False)),
         )
         for port, spec in raw.items()
     }

@@ -85,7 +85,7 @@ app = FastAPI(title="llm-gate", version="1.0", lifespan=lifespan)
 
 GATED_PATHS = {"/v1/chat/completions", "/v1/spread"}
 HALT_EXEMPT_PATHS = {"/health", "/admin/halt", "/admin/unlock"}
-VALID_TASK_CLASSES = {"background", "experiment", "cron"}
+VALID_TASK_CLASSES = {"background", "experiment", "cron", "oneshot"}
 
 
 @app.middleware("http")
