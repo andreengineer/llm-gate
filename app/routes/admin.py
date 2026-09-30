@@ -4,7 +4,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from app import health as upstream_health_cache
-from app.halt import halt, is_halted, unlock
+from app.halt import halt, halt_status, is_halted, unlock
 from app.ledger import (
     active_surge, end_surge, global_daily_spend, last_sentinel_event,
     mid_tier_daily_spend, recent_rejections, record_sentinel_event,
@@ -21,6 +21,10 @@ router = APIRouter()
 async def health():
     return {
         "status": "halted" if is_halted() else "ok",
+        # Surfaces who/when/why for a live HALT so a forgotten kill switch is
+        # visible as a stale age_seconds instead of a silent multi-day outage
+        # (2026-09-28 incident).
+        "halt": halt_status(),
         "ports": {
             str(p): {"agent_id": identity_for_port(p).agent_id, "enforcement": identity_for_port(p).enforcement}
             for p in all_ports()
@@ -104,15 +108,15 @@ async def silence_canary_ack(agent: str, detail: str = ""):
 
 
 @router.post("/admin/halt")
-async def admin_halt():
-    halt()
-    return {"status": "halted"}
+async def admin_halt(reason: str = "", actor: str = "unknown"):
+    halt(reason=reason, actor=actor)
+    return {"status": "halted", "halt": halt_status()}
 
 
 @router.post("/admin/unlock")
-async def admin_unlock():
-    unlock()
-    return {"status": "unlocked"}
+async def admin_unlock(reason: str = "", actor: str = "unknown"):
+    unlock(actor=actor, reason=reason)
+    return {"status": "unlocked", "halt": halt_status()}
 
 
 @router.post("/v1/run/{run_id}/outcome")
