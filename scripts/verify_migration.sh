@@ -6,7 +6,76 @@
 # real default just as badly), the ledger is receiving real traffic per
 # agent, and HALT is a true global kill switch.
 set -uo pipefail
-trap 'rm -f ~/.llm-gate/HALT' EXIT  # HALT test below must never leave prod halted, even on Ctrl+C
+
+# --- HALT safety (incident 2026-09-28, root cause) --------------------------
+# The HALT test below must never leave prod halted. The old trap only fired on
+# normal exit and left ~/.llm-gate/HALT behind on SIGKILL or an rm failure —
+# exactly how the kill switch leaked for 7 days. Two guards now:
+#   1. halt_acquire/halt_release preserve any *pre-existing* HALT: the script
+#      only removes the HALT it created, so running it never un-halts prod.
+#   2. cleanup is bound to EXIT/INT/TERM/HUP.
+# --no-halt skips the destructive block entirely (prod-safe / CI).
+HALT_FILE="${LLM_GATE_HALT:-$HOME/.llm-gate/HALT}"
+HALT_PREEXISTING=0
+NO_HALT=0
+SELF_TEST=0
+
+halt_acquire() {
+    if [ -e "$HALT_FILE" ]; then
+        HALT_PREEXISTING=1
+    else
+        HALT_PREEXISTING=0
+        mkdir -p "$(dirname "$HALT_FILE")"
+        : > "$HALT_FILE"
+    fi
+}
+
+halt_release() {
+    # Restore prior state: only remove HALT if *we* created it.
+    [ "$HALT_PREEXISTING" -eq 0 ] && rm -f "$HALT_FILE"
+    return 0
+}
+
+trap 'halt_release' EXIT INT TERM HUP
+
+self_test() {
+    local tmp rc=0
+    tmp="$(mktemp -d)"
+    HALT_FILE="$tmp/HALT"
+
+    # 1. no pre-existing HALT -> acquire creates, release removes
+    halt_acquire
+    [ -e "$HALT_FILE" ] || { echo "FAIL: acquire did not create HALT"; rc=1; }
+    halt_release
+    [ -e "$HALT_FILE" ] && { echo "FAIL: release left HALT behind"; rc=1; }
+
+    # 2. pre-existing HALT -> acquire and release both preserve it
+    : > "$HALT_FILE"
+    halt_acquire
+    halt_release
+    [ -e "$HALT_FILE" ] || { echo "FAIL: release removed a pre-existing HALT (would un-halt prod)"; rc=1; }
+
+    rm -rf "$tmp"
+    [ "$rc" -eq 0 ] && echo "OK: HALT acquire/release semantics"
+    return "$rc"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-halt)   NO_HALT=1 ;;
+        --self-test) SELF_TEST=1 ;;
+        -h|--help)
+            echo "usage: $0 [--no-halt] [--self-test]"
+            exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+if [ "$SELF_TEST" -eq 1 ]; then
+    self_test
+    exit $?
+fi
 
 fail=0
 GATE_HOST="127.0.0.1"
@@ -91,7 +160,11 @@ echo
 echo "== HALT is a true global kill switch across every live port =="
 echo "   (/health is deliberately HALT-exempt so monitoring can tell 'halted'"
 echo "   from 'down' — the actual gated path is /v1/chat/completions)"
-touch ~/.llm-gate/HALT
+if [ "$NO_HALT" -eq 1 ]; then
+    echo "SKIP: --no-halt — destructive kill-switch test not exercised"
+    halt_ok=0
+else
+halt_acquire
 sleep 1
 halt_ok=1
 health_status=$(curl -sS --max-time 5 "http://${GATE_HOST}:8787/health" 2>/dev/null)
@@ -111,7 +184,7 @@ for port in "${GATE_PORTS[@]}"; do
     fi
 done
 [ "$halt_ok" -eq 1 ] && echo "OK: all ${#GATE_PORTS[@]} ports returned 503 on the gated path while HALTed"
-rm -f ~/.llm-gate/HALT
+halt_release
 sleep 1
 status=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "http://${GATE_HOST}:8787/health" 2>/dev/null)
 if [ "$status" = "200" ]; then
@@ -120,6 +193,7 @@ else
     echo "FAIL: gate did not return to healthy (200) after removing HALT, got $status"
     fail=1
 fi
+fi  # end HALT test (NO_HALT gate)
 
 echo
 echo "== resource gate: run-agent refuses a heavy agent while claw/openclaw is alive =="
