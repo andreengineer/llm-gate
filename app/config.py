@@ -90,6 +90,11 @@ class Settings(BaseSettings):
                                                # is a product signal, not just a cost event
     no_live_route_alert_dedup_minutes: int = 30
 
+    # kill switch (2026-09-28 incident, gap #4: forgot-HALT watchdog)
+    halt_stale_threshold_hours: int = 6            # HALT older than this == forgotten -> alert
+    halt_watchdog_interval_seconds: int = 1800     # check the HALT file every 30 min
+    halt_watchdog_alert_dedup_minutes: int = 360   # re-alert at most every 6h while still stale
+
     # approval
     approval_timeout_seconds: int = 90
 

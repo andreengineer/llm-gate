@@ -9,6 +9,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app import halt_watchdog
 from app.config import settings
 from app.halt import is_halted
 from app.identity import synthesize_run_id
@@ -76,9 +77,13 @@ async def lifespan(app: FastAPI):
     # routing skips dead upstreams before dispatch instead of discovering them
     # one wasted request at a time.
     health_task = asyncio.create_task(health.probe_loop())
+    # Incident 2026-09-28 gap #4: a HALT that stays engaged must not 503 silently
+    # for days — watchdog pushes a stale-HALT alert until it is released.
+    halt_task = asyncio.create_task(halt_watchdog.watchdog_loop())
     yield
     task.cancel()
     health_task.cancel()
+    halt_task.cancel()
 
 
 app = FastAPI(title="llm-gate", version="1.0", lifespan=lifespan)
